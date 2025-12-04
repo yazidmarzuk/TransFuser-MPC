@@ -222,6 +222,11 @@ class GlobalConfig:
     # Obstacle avoidance constraints
     mpc_q_obstacle = 10000.0 # Weight for obstacle avoidance penalty (high to strongly avoid)
     mpc_obstacle_safety_margin = 1.5 # Safety margin around obstacles in meters
+    mpc_obstacle_lateral_margin = 1.0 # Additional lateral margin when checking obstacles
+    mpc_obstacle_slow_distance = 15.0 # Distance in meters to start slowing for an obstacle ahead
+    mpc_obstacle_stop_distance = 7.5 # Distance in meters to force a stop for an obstacle ahead
+    mpc_obstacle_slow_speed = 2.0 # Target speed when slowing for an obstacle
+    mpc_obstacle_stop_speed = 0.2 # Target speed when stopping for an obstacle
 
     def __init__(self, root_dir='', setting='all', **kwargs):
         self.root_dir = root_dir

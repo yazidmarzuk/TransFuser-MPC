@@ -756,6 +756,26 @@ class LidarCenterNet(nn.Module):
                 desired_speed = np.clip(desired_speed, 0.0, self.config.mpc_max_speed)
             else:
                 desired_speed = self.config.default_speed
+        horizon_steps = min(len(waypoints), self.config.mpc_horizon)
+        horizon_time = max(1, horizon_steps) * self.config.mpc_dt
+        obstacles = self._process_obstacles_for_mpc(
+            rotated_bboxes,
+            horizon_time,
+            self.config.mpc_dt
+        )
+        closest_ahead = None
+        lane_clearance = self.config.mpc_lane_half_width + self.config.mpc_obstacle_lateral_margin
+        for obs_x, obs_y, obs_radius in obstacles:
+            if obs_x < -obs_radius:
+                continue
+            if abs(obs_y) > lane_clearance + obs_radius:
+                continue
+            distance_ahead = obs_x - obs_radius
+            if distance_ahead < 0.0:
+                distance_ahead = 0.0
+            if closest_ahead is None or distance_ahead < closest_ahead:
+                closest_ahead = distance_ahead
+
         if len(waypoints) >= 6:
             # Find maximum lateral displacement across horizon
             max_lateral = max(abs(wp[1]) for wp in waypoints[:min(10, len(waypoints))])
@@ -774,19 +794,30 @@ class LidarCenterNet(nn.Module):
             elif max_lateral > 0.6 or lateral_change_rate > 0.15:  # Medium turn
                 desired_speed = min(desired_speed, 4)
 
+        obstacle_brake = False
+        if closest_ahead is not None:
+            if closest_ahead < self.config.mpc_obstacle_stop_distance:
+                desired_speed = min(desired_speed, self.config.mpc_obstacle_stop_speed)
+                obstacle_brake = True
+            elif closest_ahead < self.config.mpc_obstacle_slow_distance:
+                desired_speed = min(desired_speed, self.config.mpc_obstacle_slow_speed)
+
         #Marzuk: Check if we need to brake
         brake = ((desired_speed < self.config.brake_speed) or 
                  ((speed / desired_speed) > self.config.brake_ratio) if desired_speed > 0.01 else False)
+        brake = brake or obstacle_brake
         
         # Marzuk: If braking, use simple brake logic
         if brake:
             steer, throttle = self._mpc_optimize(waypoints, speed, desired_speed, brake=True, 
-                                                 rotated_bboxes=rotated_bboxes)
+                                                 rotated_bboxes=rotated_bboxes,
+                                                 obstacles=obstacles)
             return steer, 0.0, True
         
         # Marzuk: calling the MPC optimization
         steer, throttle = self._mpc_optimize(waypoints, speed, desired_speed, brake=False,
-                                             rotated_bboxes=rotated_bboxes)
+                                             rotated_bboxes=rotated_bboxes,
+                                             obstacles=obstacles)
         
         max_steer_change = 0.15  # Maximum change per timestep (0.05s)
         steer_change = steer - self.prev_steer
@@ -1071,111 +1102,6 @@ class LidarCenterNet(nn.Module):
         
         return steer, throttle
     
-    def _mpc_scipy(self, waypoints, yaw_refs, current_speed, desired_speed, brake,
-                   dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
-                   obstacles=None):
-        '''MPC using scipy.optimize (fallback)'''
-        N = len(waypoints)
-        
-        # Decision variables: [steer_0, throttle_0, ..., steer_N-1, throttle_N-1]
-        n_vars = 2 * N
-        x0 = np.zeros(n_vars)
-        
-        # Bounds
-        bounds = [(-1.0, 1.0) if i % 2 == 0 else (0.0, self.config.clip_throttle) 
-                 for i in range(n_vars)]
-        
-        # Objective function
-        def objective(u_vec):
-            u = u_vec.reshape(N, 2)
-            state = np.array([0.0, 0.0, 0.0, current_speed])  # [x, y, yaw, speed]
-            cost = 0.0
-            lane_half_width = self.config.mpc_lane_half_width
-            lane_penalty = self.config.mpc_lane_penalty
-            
-            for k in range(N):
-                steer_k = u[k, 0]
-                throttle_k = u[k, 1]
-                
-                # Kinematic bicycle model
-                wheel = steer_gain * steer_k
-                # Slip angle calculation (matching EgoModel)
-                # beta = atan(rear_wb / (front_wb + rear_wb) * tan(wheel))
-                beta = np.arctan(rear_wb / (front_wb + rear_wb) * np.tan(wheel))
-                
-                if brake:
-                    accel = brake_accel
-                else:
-                    accel = throt_accel * throttle_k
-                
-                # State update
-                state[0] += state[3] * np.cos(state[2] + beta) * dt
-                state[1] += state[3] * np.sin(state[2] + beta) * dt
-                state[2] += state[3] / rear_wb * np.sin(beta) * dt
-                state[3] = max(0.0, state[3] + accel * dt)
-                state[3] = np.clip(state[3], self.config.mpc_min_speed, self.config.mpc_max_speed)
-                
-                # Costs
-                wp = waypoints[k]
-                tracking_error = (state[0] - wp[0])**2 + (state[1] - wp[1])**2
-                cost += self.config.mpc_q_tracking * tracking_error
-                
-                speed_error = (state[3] - desired_speed)**2
-                cost += self.config.mpc_q_speed * speed_error
-                
-                # Heading alignment cost
-                yaw_error = state[2] - yaw_refs[k]
-                yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
-                cost += self.config.mpc_q_yaw * yaw_error**2
-
-                cost += self.config.mpc_r_steer * steer_k**2
-                cost += self.config.mpc_r_throttle * throttle_k**2
-
-                # Lane penalty (hard constraint beyond half width)
-                lateral_pos = state[1]
-                lane_violation = max(0.0, abs(lateral_pos) - lane_half_width)
-                cost += lane_penalty * lane_violation**2
-                # Soft center penalty
-                cost += self.config.mpc_center_weight * lateral_pos**2
-                
-                # Obstacle avoidance penalty
-                if obstacles is not None and len(obstacles) > 0:
-                    for obs_x, obs_y, obs_radius in obstacles:
-                        # Distance from predicted position to obstacle center
-                        dist_to_obs = np.sqrt((state[0] - obs_x)**2 + (state[1] - obs_y)**2)
-                        # Penalty if too close (inverse distance with safety margin)
-                        safety_dist = obs_radius
-                        if dist_to_obs < safety_dist:
-                            # Strong penalty when inside safety margin
-                            obstacle_penalty = self.config.mpc_q_obstacle * (safety_dist - dist_to_obs)**2
-                            cost += obstacle_penalty
-            
-            # Terminal cost
-            if N > 0:
-                wp_terminal = waypoints[-1]
-                terminal_error = (state[0] - wp_terminal[0])**2 + (state[1] - wp_terminal[1])**2
-                cost += self.config.mpc_q_terminal * terminal_error
-            
-            return cost
-        
-        # Solve
-        try:
-            result = minimize(objective, x0, method='SLSQP', bounds=bounds, 
-                            options={'maxiter': 50, 'ftol': 1e-4})
-            u_opt = result.x.reshape(N, 2)
-            steer = float(u_opt[0, 0])
-            throttle = float(u_opt[0, 1])
-        except:
-            # Fallback
-            if len(waypoints) > 0:
-                aim = waypoints[0]
-                angle = np.arctan2(aim[1], aim[0])
-                steer = np.clip(angle / (np.pi/2), -1.0, 1.0)
-            else:
-                steer = 0.0
-            throttle = 0.5 if not brake else 0.0
-        
-        return steer, throttle
 
 
 
