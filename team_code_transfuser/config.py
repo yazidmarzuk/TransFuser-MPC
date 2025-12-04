@@ -208,13 +208,13 @@ class GlobalConfig:
     mpc_dt = 0.05 # Time step for MPC (20 FPS = 0.05s)
     mpc_max_speed = 8.0 # Maximum speed in m/s when MPC tuned for corners
     mpc_min_speed = 0.0 # Minimum speed in m/s
-    mpc_q_tracking = 1000.0 # Weight for tracking error (waypoint following)
+    mpc_q_tracking = 1200.0 # Weight for tracking error (waypoint following)
     mpc_q_speed = 5.0 # Weight for speed tracking
-    mpc_r_steer = 1125 # Weight for steering control effort (higher -> smoother turns)
+    mpc_r_steer = 5525 # Weight for steering control effort (higher -> smoother turns)
     mpc_r_throttle = 0.5 # Weight for throttle control effort
     mpc_r_brake = 0.5 # Weight for brake control effort
     mpc_q_terminal = 5.0 # Terminal cost weight (final waypoint)
-    mpc_q_yaw = 0 # Weight for heading alignment
+    mpc_q_yaw = 1 # Weight for heading alignment
     mpc_lane_half_width = 1.2 # Allowed lateral deviation from the route centre (meters)
     mpc_lane_penalty = 5000.0 # Penalty weight when exceeding lane width
     mpc_steer_gain = 0.36848336 # Gain translating steering command to wheel angle

@@ -901,14 +901,10 @@ class LidarCenterNet(nn.Module):
         horizon_time = N * dt
         obstacles = self._process_obstacles_for_mpc(rotated_bboxes, horizon_time, dt)
 
-        if CASADI_AVAILABLE:
-            return self._mpc_casadi(waypoints[:N], yaw_refs, current_speed, desired_speed, brake,
+        return self._mpc_casadi(waypoints[:N], yaw_refs, current_speed, desired_speed, brake,
                                     dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
                                     obstacles=obstacles)
-        else:
-            return self._mpc_scipy(waypoints[:N], yaw_refs, current_speed, desired_speed, brake,
-                                    dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
-                                    obstacles=obstacles)
+        
     
     def _mpc_casadi(self, waypoints, yaw_refs, current_speed, desired_speed, brake,
                     dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
@@ -1019,44 +1015,44 @@ class LidarCenterNet(nn.Module):
             'print_time': False,
             'ipopt.sb': 'yes',
         })
-        print("Optimizer solver called")
+        # print("Optimizer solver called")
         
         try:
             sol = opti.solve()
             steer = float(sol.value(U[0, 0]))
             throttle = float(sol.value(U[1, 0]))
             
-            # === MARZUK DIAGNOSTIC LOGS ===
-            print(f"\n=== MPC SOLUTION ===")
-            print(f"Commanded Steer: {steer:.4f}")
-            print(f"Wheel Angle: {steer * steer_gain:.4f} rad = {np.degrees(steer * steer_gain):.2f}°")
-            print(f"Speed: {current_speed:.2f} m/s")
+            # # === MARZUK DIAGNOSTIC LOGS ===
+            # print(f"\n=== MPC SOLUTION ===")
+            # print(f"Commanded Steer: {steer:.4f}")
+            # print(f"Wheel Angle: {steer * steer_gain:.4f} rad = {np.degrees(steer * steer_gain):.2f}°")
+            # print(f"Speed: {current_speed:.2f} m/s")
             
-            # Predicted trajectory (first 5 steps)
-            print(f"Predicted path (x,y):")
-            for k in range(min(5, N+1)):
-                x_pred = float(sol.value(X[0, k]))
-                y_pred = float(sol.value(X[1, k]))
-                yaw_pred = float(sol.value(X[2, k]))
-                print(f"  Step {k}: ({x_pred:.3f}, {y_pred:.3f}), yaw={np.degrees(yaw_pred):.1f}°")
+            # # Predicted trajectory (first 5 steps)
+            # print(f"Predicted path (x,y):")
+            # for k in range(min(5, N+1)):
+            #     x_pred = float(sol.value(X[0, k]))
+            #     y_pred = float(sol.value(X[1, k]))
+            #     yaw_pred = float(sol.value(X[2, k]))
+            #     print(f"  Step {k}: ({x_pred:.3f}, {y_pred:.3f}), yaw={np.degrees(yaw_pred):.1f}°")
             
-            # Target waypoints (first 5)
-            print(f"Target waypoints (x,y):")
-            for k in range(min(5, N)):
-                print(f"  WP {k}: ({waypoints[k][0]:.3f}, {waypoints[k][1]:.3f})")
+            # # Target waypoints (first 5)
+            # print(f"Target waypoints (x,y):")
+            # for k in range(min(5, N)):
+            #     print(f"  WP {k}: ({waypoints[k][0]:.3f}, {waypoints[k][1]:.3f})")
             
-            # Error between predicted and target
-            print(f"Prediction errors (lateral):")
-            for k in range(min(5, N)):
-                x_pred = float(sol.value(X[0, k+1]))
-                y_pred = float(sol.value(X[1, k+1]))
-                y_error = y_pred - waypoints[k][1]
-                print(f"  Step {k}: lateral_error = {y_error:.3f}m")
+            # # Error between predicted and target
+            # print(f"Prediction errors (lateral):")
+            # for k in range(min(5, N)):
+            #     x_pred = float(sol.value(X[0, k+1]))
+            #     y_pred = float(sol.value(X[1, k+1]))
+            #     y_error = y_pred - waypoints[k][1]
+            #     print(f"  Step {k}: lateral_error = {y_error:.3f}m")
             
-            # Cost breakdown (if you can compute it)
-            total_cost = float(sol.value(cost))
-            print(f"Total cost: {total_cost:.2f}")
-            print(f"===================\n")
+            # # Cost breakdown (if you can compute it)
+            # total_cost = float(sol.value(cost))
+            # print(f"Total cost: {total_cost:.2f}")
+            # print(f"===================\n")
             
             yaw_trajectory = [float(sol.value(X[2, k])) for k in range(min(3, N+1))]
 
@@ -1213,11 +1209,26 @@ class LidarCenterNet(nn.Module):
         pred_bev = F.interpolate(pred_bev, (self.config.bev_resolution_height, self.config.bev_resolution_width), mode='bilinear', align_corners=True)
 
         preds = self.head([features[0]])
-        results = self.head.get_bboxes(preds[0], preds[1], preds[2], preds[3], preds[4], preds[5], preds[6])
-        bboxes, _ = results[0]
+
+        # Marzuk: get bboxes from the detection head
+        # 
+        # preds[0]: center heatmap prediction
+        # preds[1]: width and height prediction
+        # preds[2]: offset prediction
+        # preds[3]: yaw class prediction
+        # preds[4]: yaw residual prediction
+        # preds[5]: velocity prediction
+        # preds[6]: brake prediction
+        results = self.head.get_bboxes(preds[0], preds[1], preds[2], preds[3], preds[4], preds[5], preds[6]) #
+        bboxes, _ = results[0] # bbox format: [x, y, w, h, yaw, velocity, brake, confidence])
 
         # filter bbox based on the confidence of the prediction
         bboxes = bboxes[bboxes[:, -1] > self.config.bb_confidence_threshold]
+        for idx, det in enumerate(bboxes.detach().cpu().numpy()):
+            cx, cy, w, l, yaw, vel, brake, conf = det
+            print(f"[det {idx:02d}] pos=({cx:.2f}, {cy:.2f}) m "
+                f"conf={conf:.2f} vel={vel:.2f} "
+                f"brake={brake:.2f}")
         rotated_bboxes = []
         for bbox in bboxes.detach().cpu().numpy():
             # Extract speed before transformation (bbox format: [x, y, w, h, yaw, velocity, brake, confidence])
