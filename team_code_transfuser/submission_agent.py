@@ -28,7 +28,7 @@ else:
     pathlib.Path(SAVE_PATH).mkdir(parents=True, exist_ok=True)
 
 def get_entry_point():
-    return 'HybridAgent'
+    return 'HybridAgent' #Marzuk: This is the entry point for the agent
 
 
 class HybridAgent(autonomous_agent.AutonomousAgent):
@@ -43,7 +43,7 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         args_file.close()
 
         # setting machine to avoid loading files
-        self.config = GlobalConfig(setting='eval')
+        self.config = GlobalConfig(setting='eval') 
 
         if ('sync_batch_norm' in self.args):
             self.config.sync_batch_norm = bool(self.args['sync_batch_norm'])
@@ -59,12 +59,12 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             use_velocity = True
 
         if ('image_architecture' in self.args):
-            image_architecture = self.args['image_architecture']
+            image_architecture = self.args['image_architecture'] #Marzuk: regnety_032
         else:
             image_architecture = 'resnet34'
 
         if ('lidar_architecture' in self.args):
-            lidar_architecture = self.args['lidar_architecture']
+            lidar_architecture = self.args['lidar_architecture'] #Marzuk: regnety_032
         else:
             lidar_architecture = 'resnet18'
 
@@ -74,7 +74,7 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             self.backbone = 'transFuser'  # Options 'geometric_fusion', 'transFuser', 'late_fusion', 'latentTF'
 
         self.gps_buffer = deque(maxlen=self.config.gps_buffer_max_len) # Stores the last x updated gps signals.
-        self.ego_model = EgoModel(dt=self.config.carla_frame_rate) # Bicycle model used for de-noising the GPS
+        self.ego_model = EgoModel(dt=self.config.carla_frame_rate) # Bicycle model used for de-noising the GPS #Marzuk: Use the same thing for MPC controller
 
         self.bb_buffer = deque(maxlen=1)
         self.lidar_pos = self.config.lidar_pos  # x, y, z coordinates of the LiDAR position.
@@ -107,6 +107,13 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         self.steer_damping = self.config.steer_damping
         self.rgb_back = None #For debugging
 
+        log_dir = SAVE_PATH if SAVE_PATH else os.path.join(os.getcwd(), 'results')
+        os.makedirs(log_dir, exist_ok=True)
+        self.waypoint_log_path = os.path.join(log_dir, 'waypoint_log.csv')
+        with open(self.waypoint_log_path, 'w') as log_file:
+            log_file.write('step,ego_x,ego_y,yaw_deg,wp_idx,wp_x_vehicle,wp_y_vehicle,wp_x_world,wp_y_world,dist,prev_wp_x_world,prev_wp_y_world,prev_error_x,prev_error_y,prev_error_dist,ref_wp_x_world,ref_wp_y_world,expert_wp_x_vehicle,expert_wp_y_vehicle,expert_wp_x_world,expert_wp_y_world,expert_dist,gru_vs_expert_dx,gru_vs_expert_dy,gru_vs_expert_dist\n')
+        self.prev_predicted_wp_world = None
+        self.log_max_expert = 10
 
 
     def _init(self):
@@ -215,11 +222,20 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         result['gps'] = pos
 
         self.gps_buffer.append(pos)
-        denoised_pos = np.average(self.gps_buffer, axis=0)
+        denoised_pos = np.average(self.gps_buffer, axis=0) #   Denoised position
+        result['denoised_gps'] = denoised_pos
 
         waypoint_route = self._route_planner.run_step(denoised_pos)
         next_wp, next_cmd = waypoint_route[1] if len(waypoint_route) > 1 else waypoint_route[0]
         result['next_command'] = next_cmd.value
+        result['current_ref_world'] = tuple(next_wp)
+
+        expert_world = []
+        for idx, (wp_pos, _) in enumerate(waypoint_route):
+            if idx >= self.log_max_expert:
+                break
+            expert_world.append(self._route_planner.mean + wp_pos)
+        result['expert_route_world'] = expert_world
 
         theta = compass + np.pi/2
         R = np.array([
@@ -228,8 +244,8 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             ])
 
         local_command_point = np.array([next_wp[0]-denoised_pos[0], next_wp[1]-denoised_pos[1]])
-        local_command_point = R.T.dot(local_command_point)
-        result['target_point'] = tuple(local_command_point)
+        local_command_point = R.T.dot(local_command_point) # Marzuk: converts into ego position
+        result['target_point'] = tuple(local_command_point) # Marzuk: this is used by GRU 
 
         return result
 
@@ -291,14 +307,16 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         with torch.no_grad():
             pred_wps = []
             bounding_boxes = []
+            pred_bevs = []
             for i in range(self.model_count):
                 rotated_bb = []
+                pred_bev = None
                 if (self.backbone == 'transFuser'):
-                    pred_wp, _ = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity,
+                    pred_wp, rotated_bb, pred_bev = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity,
                                                           num_points=num_points, save_path=SAVE_PATH, stuck_detector=self.stuck_detector,
                                                           forced_move=is_stuck, debug=self.config.debug, rgb_back=self.rgb_back)
                 elif (self.backbone == 'late_fusion'):
-                    pred_wp, _ = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity, num_points=num_points)
+                    pred_wp, rotated_bb, pred_bev = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity, num_points=num_points)
                 elif (self.backbone == 'geometric_fusion'):
                     bev_points = list()
                     cam_points = list()
@@ -309,19 +327,22 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
 
                     bev_points = bev_points[0].long().to('cuda', dtype=torch.int64)
                     cam_points = cam_points[0].long().to('cuda', dtype=torch.int64)
-                    pred_wp, _ = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity, bev_points, cam_points, num_points=num_points)
+                    pred_wp, rotated_bb, pred_bev = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity, bev_points, cam_points, num_points=num_points)
                 elif (self.backbone == 'latentTF'):
-                    pred_wp, rotated_bb = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity, num_points=num_points)
+                    pred_wp, rotated_bb, pred_bev = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity, num_points=num_points)
                 else:
                     raise ("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF")
 
                 pred_wps.append(pred_wp)
                 bounding_boxes.append(rotated_bb)
+                pred_bevs.append(pred_bev)
 
         bbs_vehicle_coordinate_system = self.non_maximum_suppression(bounding_boxes, self.iou_treshold_nms)
 
         self.bb_buffer.append(bbs_vehicle_coordinate_system)
         self.pred_wp = torch.stack(pred_wps, dim=0).mean(dim=0) #Average the predictions from the ensembles
+        # Use first model's BEV prediction (or average if needed)
+        pred_bev_combined = pred_bevs[0] if len(pred_bevs) > 0 and pred_bevs[0] is not None else None
 
         # transform to local coordinates
         pred_wp_transformed = []
@@ -337,6 +358,9 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
 
         self.pred_wp = np.stack(pred_wp_transformed, axis=0)
         self.pred_wp = torch.median(torch.from_numpy(self.pred_wp).to('cuda', dtype=torch.float32), dim=0, keepdims=True)[0]
+
+        predicted_wp_vehicle = self.pred_wp[0].detach().cpu().numpy()
+        # self._log_waypoint_deviation(tick_data, predicted_wp_vehicle)
 
         if (self.backbone == 'latentTF'):
             safety_box = []
@@ -359,7 +383,11 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             safety_box      = safety_box[safety_box[..., 0] > self.config.safety_box_x_min]
             safety_box      = safety_box[safety_box[..., 0] < self.config.safety_box_x_max]
 
-        steer, throttle, brake = self.nets[0].control_pid(self.pred_wp, gt_velocity, is_stuck)
+        # steer, throttle, brake = self.nets[0].control_pid(self.pred_wp, gt_velocity, is_stuck)
+        
+        
+        # Marzuk: using MPC controller with obstacle avoidance
+        steer, throttle, brake = self.nets[0].control_mpc(self.pred_wp, gt_velocity, is_stuck, rotated_bboxes=bbs_vehicle_coordinate_system)
         
         if is_stuck and self.forced_move==1: # no steer for initial frame when unblocking
             steer = 0.0
@@ -467,6 +495,7 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             self.gps_buffer[i] = next_loc
 
         return None
+
 
     def get_bb_yaw(self, box):
         location_2 = box[2]

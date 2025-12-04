@@ -10,6 +10,27 @@ from agents.navigation.global_route_planner_dao import GlobalRoutePlannerDAO
 
 DEBUG = False
 
+Class MPC_Controller(object):
+
+    def __init__(self, model, optimizer, dataloader_train, dataloader_val, args, config, writer, device, rank=0, world_size=1, parallel=False, cur_epoch=0):
+        self.model = model
+        self.optimizer = optimizer
+        self.dataloader_train = dataloader_train
+        self.dataloader_val = dataloader_val
+        self.args = args
+        self.config = config
+        self.writer = writer
+        self.device = device
+        self.rank = rank
+        self.world_size = world_size
+        self.parallel = parallel
+        self.cur_epoch = cur_epoch
+
+
+
+
+
+
 
 class PIDController(object):
     def __init__(self, K_P=1.0, K_I=0.0, K_D=0.0, n=20):
@@ -63,6 +84,11 @@ class PIDController(object):
 
     def load(self):
         self._window = self._saved_window
+
+
+
+
+
 
 class Plotter(object):
     def __init__(self, size):

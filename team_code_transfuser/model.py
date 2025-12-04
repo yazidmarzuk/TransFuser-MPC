@@ -1,6 +1,8 @@
 from collections import deque
 import torch.nn.functional as F
 import cv2
+import numpy as np
+import math
 
 from utils import *
 from transfuser import TransfuserBackbone, SegDecoder, DepthDecoder
@@ -13,6 +15,15 @@ from point_pillar import PointPillarNet
 
 from PIL import Image, ImageFont, ImageDraw
 from torchvision import models
+
+# Try to import CasADi, fallback to scipy if not available
+try:
+    import casadi as ca
+    CASADI_AVAILABLE = True
+except ImportError:
+    CASADI_AVAILABLE = False
+    print("Warning: CasADi not available, MPC will use scipy.optimize")
+    from scipy.optimize import minimize
 
 # Copyright (c) OpenMMLab. All rights reserved.
 import torch
@@ -89,6 +100,8 @@ class LidarCenterNetHead(BaseDenseHead, BBoxTestMixin):
         self.test_cfg = test_cfg
         self.fp16_enabled = train_cfg.fp16_enabled
         self.i = 0
+
+
 
     def _build_head(self, in_channel, feat_channel, out_channel):
         """Build head for each branch."""
@@ -550,6 +563,7 @@ class LidarCenterNet(nn.Module):
         self.use_target_point_image = config.use_target_point_image
         self.gru_concat_target_point = config.gru_concat_target_point
         self.use_point_pillars = config.use_point_pillars
+        self.prev_steer = 0.0
 
         if(self.use_point_pillars == True):
             self.point_pillar_net = PointPillarNet(config.num_input, config.num_features,
@@ -560,19 +574,19 @@ class LidarCenterNet(nn.Module):
 
         self.backbone = backbone
 
-
-        if(backbone == 'transFuser'):
+        # Marzuk: init the model based on the backbone
+        if(backbone     == 'transFuser'):
             self._model = TransfuserBackbone(config, image_architecture, lidar_architecture, use_velocity=use_velocity).to(self.device)
-        elif(backbone == 'late_fusion'):
+        elif(backbone   == 'late_fusion'):
             self._model = LateFusionBackbone(config, image_architecture, lidar_architecture, use_velocity=use_velocity).to(self.device)
-        elif(backbone == 'geometric_fusion'):
+        elif(backbone   == 'geometric_fusion'):
             self._model = GeometricFusionBackbone(config, image_architecture, lidar_architecture, use_velocity=use_velocity).to(self.device)
-        elif (backbone == 'latentTF'):
+        elif (backbone  == 'latentTF'):
             self._model = latentTFBackbone(config, image_architecture, lidar_architecture, use_velocity=use_velocity).to(self.device)
         else:
             raise("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF")
 
-        if config.multitask:
+        if config.multitask: # Marzuk: if multitask is True, we will use the segmentation and depth decoders
             self.seg_decoder   = SegDecoder(self.config,   self.config.perception_output_features).to(self.device)
             self.depth_decoder = DepthDecoder(self.config, self.config.perception_output_features).to(self.device)
 
@@ -588,8 +602,8 @@ class LidarCenterNet(nn.Module):
         self.head = LidarCenterNetHead(channel, channel, 1, train_cfg=config).to(self.device)
         self.i = 0
 
-        # waypoints prediction
-        self.join = nn.Sequential(
+        # Marzuk: Join the features to get the waypoints prediction
+        self.join = nn.Sequential(                
                             nn.Linear(512, 256),
                             nn.ReLU(inplace=True),
                             nn.Linear(256, 128),
@@ -608,6 +622,12 @@ class LidarCenterNet(nn.Module):
         self.turn_controller = PIDController(K_P=config.turn_KP, K_I=config.turn_KI, K_D=config.turn_KD, n=config.turn_n)
         self.speed_controller = PIDController(K_P=config.speed_KP, K_I=config.speed_KI, K_D=config.speed_KD, n=config.speed_n)
 
+
+
+
+
+
+    # Marzuk: gru outputs future waypoints in the ego coordinate system
     def forward_gru(self, z, target_point):
         z = self.join(z)
     
@@ -635,7 +655,7 @@ class LidarCenterNet(nn.Module):
             
         pred_wp = torch.stack(output_wp, dim=1)
 
-        # pred the wapoints in the vehicle coordinate and we convert it to lidar coordinate here because the GT waypoints is in lidar coordinate
+        #Marzuk: pred the wapoints in the vehicle coordinate and we convert it to lidar coordinate here because the GT waypoints is in lidar coordinate
         pred_wp[:, :, 0] = pred_wp[:, :, 0] - self.config.lidar_pos[0]
             
         pred_brake = None
@@ -645,6 +665,9 @@ class LidarCenterNet(nn.Module):
 
         return pred_wp, pred_brake, steer, throttle, brake
 
+
+
+    # TODO: MARZUK: Make this MPC controller
     def control_pid(self, waypoints, velocity, is_stuck):
         ''' Predicts vehicle control with a PID controller.
         Args:
@@ -682,6 +705,486 @@ class LidarCenterNet(nn.Module):
 
         return steer, throttle, brake
     
+
+    # Marzuk: MPC controller
+    def control_mpc(self, waypoints, velocity, is_stuck, rotated_bboxes=None):
+        ''' Predicts vehicle control with a MPC controller.
+        Args:
+            waypoints (tensor): predicted waypoints from self.plan() [1, N, 2] or [N, 2] in vehicle frame
+            velocity (tensor): current speed in m/s [1] or scalar
+            is_stuck (bool): whether vehicle is stuck
+            rotated_bboxes (list): list of detected objects, each containing (bbox_corners, brake, confidence)
+        Returns:
+            steer (float): steering command in [-1, 1]
+            throttle (float): throttle command in [0, 1]
+            brake (bool): brake command
+        '''
+        # Handle different input formats
+        if isinstance(waypoints, torch.Tensor):
+            if waypoints.dim() == 3:
+                # [1, N, 2] -> [N, 2]
+                waypoints = waypoints[0].data.cpu().numpy()
+            elif waypoints.dim() == 2:
+                waypoints = waypoints.data.cpu().numpy()
+            else:
+                waypoints = waypoints.data.cpu().numpy()
+        else:
+            waypoints = np.array(waypoints)
+        
+        if waypoints.ndim == 1:
+            waypoints = waypoints.reshape(1, -1)
+        
+        # Transform waypoints from lidar coordinate to vehicle coordinate
+        waypoints[:, 0] += self.config.lidar_pos[0]
+        
+        # Handle velocity input
+        if isinstance(velocity, torch.Tensor):
+            if velocity.dim() > 0:
+                speed = velocity[0].data.cpu().numpy() if velocity.size(0) > 0 else velocity.item()
+            else:
+                speed = velocity.item()
+        else:
+            speed = float(velocity)
+        
+        # If stuck, use default speed
+        if is_stuck:
+            desired_speed = self.config.default_speed
+        else:
+            # Compute desired speed from waypoint spacing
+            if len(waypoints) > 1:
+                desired_speed = np.linalg.norm(waypoints[1] - waypoints[0]) / self.config.mpc_dt
+                desired_speed = np.clip(desired_speed, 0.0, self.config.mpc_max_speed)
+            else:
+                desired_speed = self.config.default_speed
+        if len(waypoints) >= 6:
+            # Find maximum lateral displacement across horizon
+            max_lateral = max(abs(wp[1]) for wp in waypoints[:min(10, len(waypoints))])
+            
+            # Also check lateral change rate (how aggressively turn develops)
+            if len(waypoints) >= 8:
+                lateral_change_rate = abs(waypoints[min(8, len(waypoints)-1)][1] - waypoints[2][1]) / 6.0
+            else:
+                lateral_change_rate = 0.0
+            
+            # Apply speed limits based on max lateral OR change rate
+            if max_lateral > 2.0 or lateral_change_rate > 0.4:  # Very sharp turn
+                desired_speed = min(desired_speed, 2)
+            elif max_lateral > 1.2 or lateral_change_rate > 0.25:  # Sharp turn
+                desired_speed = min(desired_speed, 3)
+            elif max_lateral > 0.6 or lateral_change_rate > 0.15:  # Medium turn
+                desired_speed = min(desired_speed, 4)
+
+        #Marzuk: Check if we need to brake
+        brake = ((desired_speed < self.config.brake_speed) or 
+                 ((speed / desired_speed) > self.config.brake_ratio) if desired_speed > 0.01 else False)
+        
+        # Marzuk: If braking, use simple brake logic
+        if brake:
+            steer, throttle = self._mpc_optimize(waypoints, speed, desired_speed, brake=True, 
+                                                 rotated_bboxes=rotated_bboxes)
+            return steer, 0.0, True
+        
+        # Marzuk: calling the MPC optimization
+        steer, throttle = self._mpc_optimize(waypoints, speed, desired_speed, brake=False,
+                                             rotated_bboxes=rotated_bboxes)
+        
+        max_steer_change = 0.15  # Maximum change per timestep (0.05s)
+        steer_change = steer - self.prev_steer
+        steer = self.prev_steer + np.clip(steer_change, -max_steer_change, max_steer_change)
+        self.prev_steer = steer
+
+        # Clip outputs
+        steer = np.clip(steer, -1.0, 1.0)
+        throttle = np.clip(throttle, 0.0, self.config.clip_throttle)
+        
+        return steer, throttle, False
+    
+    def _process_obstacles_for_mpc(self, rotated_bboxes, horizon_time, dt):
+        '''
+        Process detected obstacles for MPC constraint.
+        Returns list of (center_x, center_y, radius) for each obstacle.
+        '''
+        if rotated_bboxes is None or len(rotated_bboxes) == 0:
+            return []
+        
+        obstacles = []
+        safety_margin = self.config.mpc_obstacle_safety_margin
+        
+        for bbox_data in rotated_bboxes:
+            # Expected tuple format: (bbox_corners, brake, confidence, optional speed, ...)
+            if bbox_data is None or len(bbox_data) < 3:
+                continue
+
+            bbox_corners = bbox_data[0]
+            brake = bbox_data[1]
+            confidence = bbox_data[2]
+            raw_speed = bbox_data[3] if len(bbox_data) >= 4 else 0.0
+            try:
+                speed = float(raw_speed)
+            except (TypeError, ValueError):
+                speed = float(np.asarray(raw_speed).reshape(-1)[0]) if np.asarray(raw_speed).size > 0 else 0.0
+            
+            # bbox_corners is [6, 3] array: 4 corners + center + velocity visualization point
+            if bbox_corners.shape[0] < 5:
+                continue
+            
+            # Get center position (index 4 is center)
+            center = bbox_corners[4, :2]  # [x, y] in vehicle frame
+            
+            # Estimate bounding radius from corners
+            corners = bbox_corners[:4, :2]  # First 4 are corners
+            distances = np.linalg.norm(corners - center, axis=1)
+            radius = np.max(distances) + safety_margin
+            
+            # Predict future position using actual speed if available
+            if speed > 0.1 and bbox_corners.shape[0] >= 6:  # Moving obstacle with speed info
+                # Get direction from velocity visualization point (index 5)
+                velocity_point = bbox_corners[5, :2]  # Point ahead in direction of motion
+                velocity_dir = velocity_point - center  # Direction vector
+                velocity_magnitude = np.linalg.norm(velocity_dir)
+                
+                if velocity_magnitude > 0.01:
+                    # Normalize direction and use actual speed
+                    velocity_unit = velocity_dir / velocity_magnitude
+                    velocity_vec = velocity_unit * speed  # Use actual speed from detection
+                    predicted_center = center + velocity_vec * horizon_time
+                    obstacles.append((predicted_center[0], predicted_center[1], radius))
+                else:
+                    # Static obstacle
+                    obstacles.append((center[0], center[1], radius))
+            else:
+                # Static obstacle (no speed or speed too low)
+                obstacles.append((center[0], center[1], radius))
+        
+        return obstacles
+    
+    def _mpc_optimize(self, waypoints, current_speed, desired_speed, brake=False, 
+                      rotated_bboxes=None):
+        '''
+        MPC optimization using CasADi or scipy.
+        Args:
+            waypoints: [N, 2] array of waypoints in vehicle frame
+            current_speed: current speed in m/s
+            desired_speed: desired speed in m/s
+            brake: whether braking
+            rotated_bboxes: list of detected objects for obstacle avoidance
+        Returns:
+            steer: steering command
+            throttle: throttle command
+        '''
+        N = min(len(waypoints), self.config.mpc_horizon)
+        dt = self.config.mpc_dt
+        
+        #Marzuk: Kinematic bicycle model parameters (got this from EgoModel)
+        front_wb = -0.090769015
+        rear_wb = 1.4178275
+        steer_gain = self.config.mpc_steer_gain
+        brake_accel = -4.952399
+        throt_accel = 0.5633837
+
+        # Pre-compute heading references for yaw alignment
+        yaw_refs = []
+        for idx in range(N):
+            if idx < N - 1:
+                dx = waypoints[idx + 1][0] - waypoints[idx][0]
+                dy = waypoints[idx + 1][1] - waypoints[idx][1]
+            elif idx > 0:
+                dx = waypoints[idx][0] - waypoints[idx - 1][0]
+                dy = waypoints[idx][1] - waypoints[idx - 1][1]
+            else:
+                dx, dy = 1.0, 0.0
+            yaw_refs.append(math.atan2(dy, dx))
+        
+        yaw_refs = yaw_refs[:N]
+        
+        # Process obstacles for MPC
+        horizon_time = N * dt
+        obstacles = self._process_obstacles_for_mpc(rotated_bboxes, horizon_time, dt)
+
+        if CASADI_AVAILABLE:
+            return self._mpc_casadi(waypoints[:N], yaw_refs, current_speed, desired_speed, brake,
+                                    dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
+                                    obstacles=obstacles)
+        else:
+            return self._mpc_scipy(waypoints[:N], yaw_refs, current_speed, desired_speed, brake,
+                                    dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
+                                    obstacles=obstacles)
+    
+    def _mpc_casadi(self, waypoints, yaw_refs, current_speed, desired_speed, brake,
+                    dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
+                    obstacles=None):
+        N = len(waypoints)
+        # print(f"Marzuk: MPC USING CASADI WITH HORIZON: {N}")
+        # print(f"Waypoints[0:3]: {waypoints[:3]}")  
+        # print(f"Speed: {current_speed:.2f} → {desired_speed:.2f}")
+        # print(f"Yaw Refs: {yaw_refs[:3]}")
+
+        opti = ca.Opti()
+        X = opti.variable(4, N+1)
+        U = opti.variable(2, N)
+        
+        x0 = ca.DM([0.0, 0.0, 0.0, current_speed])
+        opti.subject_to(X[:, 0] == x0)
+        
+        cost = 0
+        lane_half_width = self.config.mpc_lane_half_width
+        lane_penalty = self.config.mpc_lane_penalty
+        
+        for k in range(N):
+            x_k = X[0, k]
+            y_k = X[1, k]
+            yaw_k = X[2, k]
+            speed_k = X[3, k]
+            steer_k = U[0, k]
+            throttle_k = U[1, k]
+            
+            # Kinematic bicycle model (existing code)
+            wheel = steer_gain * steer_k
+            denominator = front_wb + rear_wb
+            beta = ca.atan(rear_wb / denominator * ca.tan(wheel))
+            
+            if brake:
+                accel = brake_accel
+            else:
+                accel = throt_accel * throttle_k
+            
+            x_dot = speed_k * ca.cos(yaw_k + beta)
+            y_dot = speed_k * ca.sin(yaw_k + beta)
+            yaw_dot = speed_k / rear_wb * ca.sin(beta)
+            speed_dot = accel
+            
+            x_next = x_k + x_dot * dt
+            y_next = y_k + y_dot * dt
+            yaw_next = yaw_k + yaw_dot * dt
+            speed_next = ca.fmax(0.0, speed_k + speed_dot * dt)
+            
+            opti.subject_to(X[0, k+1] == x_next)
+            opti.subject_to(X[1, k+1] == y_next)
+            opti.subject_to(X[2, k+1] == yaw_next)
+            opti.subject_to(X[3, k+1] == speed_next)
+            
+            # Tracking cost
+            wp = waypoints[k]
+            tracking_error = (X[0, k+1] - wp[0])**2 + (X[1, k+1] - wp[1])**2
+            cost += self.config.mpc_q_tracking * tracking_error
+            
+            # Speed tracking cost
+            speed_error = (X[3, k+1] - desired_speed)**2
+            cost += self.config.mpc_q_speed * speed_error
+            
+            # # Heading alignment
+            # yaw_error = yaw_next - yaw_refs[k]
+            # yaw_error = ca.atan2(ca.sin(yaw_error), ca.cos(yaw_error))
+            # cost += self.config.mpc_q_yaw * yaw_error**2
+
+            # Control effort
+            cost += self.config.mpc_r_steer * steer_k**2
+            cost += self.config.mpc_r_throttle * throttle_k**2
+            
+            # Lane keeping penalty (hard constraint beyond half width)
+            lateral_pos = X[1, k+1]
+            lane_violation = ca.fmax(0, ca.fabs(lateral_pos) - lane_half_width)
+            cost += lane_penalty * lane_violation**2
+            # Soft center penalty keeps vehicle near lane middle
+            cost += self.config.mpc_center_weight * lateral_pos**2
+            
+            # Obstacle avoidance penalty
+            if obstacles is not None and len(obstacles) > 0:
+                for obs_x, obs_y, obs_radius in obstacles:
+                    # Distance from predicted position to obstacle center
+                    dist_to_obs = ca.sqrt((X[0, k+1] - obs_x)**2 + (X[1, k+1] - obs_y)**2)
+                    # Penalty if too close (inverse distance with safety margin)
+                    safety_dist = obs_radius
+                    # Use CasADi conditional: penalty only when inside safety margin
+                    violation = ca.fmax(0.0, safety_dist - dist_to_obs)
+                    obstacle_penalty = self.config.mpc_q_obstacle * violation**2
+                    cost += obstacle_penalty
+        
+        
+        # Terminal cost
+        if N > 0:
+            wp_terminal = waypoints[-1]
+            terminal_error = (X[0, N] - wp_terminal[0])**2 + (X[1, N] - wp_terminal[1])**2
+            cost += self.config.mpc_q_terminal * terminal_error
+        
+        # Constraints
+        opti.subject_to(opti.bounded(-1.0, U[0, :], 1.0))  # Steering
+        opti.subject_to(opti.bounded(0.0, U[1, :], self.config.clip_throttle))  # Throttle
+        opti.subject_to(opti.bounded(self.config.mpc_min_speed, X[3, :], self.config.mpc_max_speed))  # Speed
+        
+        # Solve
+        opti.minimize(cost)
+        opti.solver('ipopt', {
+            'ipopt.print_level': 0, # Marzuk: Suppress solver output
+            'print_time': False,
+            'ipopt.sb': 'yes',
+        })
+        print("Optimizer solver called")
+        
+        try:
+            sol = opti.solve()
+            steer = float(sol.value(U[0, 0]))
+            throttle = float(sol.value(U[1, 0]))
+            
+            # === MARZUK DIAGNOSTIC LOGS ===
+            print(f"\n=== MPC SOLUTION ===")
+            print(f"Commanded Steer: {steer:.4f}")
+            print(f"Wheel Angle: {steer * steer_gain:.4f} rad = {np.degrees(steer * steer_gain):.2f}°")
+            print(f"Speed: {current_speed:.2f} m/s")
+            
+            # Predicted trajectory (first 5 steps)
+            print(f"Predicted path (x,y):")
+            for k in range(min(5, N+1)):
+                x_pred = float(sol.value(X[0, k]))
+                y_pred = float(sol.value(X[1, k]))
+                yaw_pred = float(sol.value(X[2, k]))
+                print(f"  Step {k}: ({x_pred:.3f}, {y_pred:.3f}), yaw={np.degrees(yaw_pred):.1f}°")
+            
+            # Target waypoints (first 5)
+            print(f"Target waypoints (x,y):")
+            for k in range(min(5, N)):
+                print(f"  WP {k}: ({waypoints[k][0]:.3f}, {waypoints[k][1]:.3f})")
+            
+            # Error between predicted and target
+            print(f"Prediction errors (lateral):")
+            for k in range(min(5, N)):
+                x_pred = float(sol.value(X[0, k+1]))
+                y_pred = float(sol.value(X[1, k+1]))
+                y_error = y_pred - waypoints[k][1]
+                print(f"  Step {k}: lateral_error = {y_error:.3f}m")
+            
+            # Cost breakdown (if you can compute it)
+            total_cost = float(sol.value(cost))
+            print(f"Total cost: {total_cost:.2f}")
+            print(f"===================\n")
+            
+            yaw_trajectory = [float(sol.value(X[2, k])) for k in range(min(3, N+1))]
+
+
+        except Exception as e:
+            print(f"✗ OPTIMIZER FAILED: {type(e).__name__}: {str(e)}")
+
+            # Fallback to simple control if optimization fails
+            if len(waypoints) > 0:
+                aim = waypoints[0]
+                angle = np.arctan2(aim[1], aim[0])
+                steer = np.clip(angle / (np.pi/2), -1.0, 1.0)
+            else:
+                steer = 0.0
+            throttle = 0.5 if not brake else 0.0
+        
+        return steer, throttle
+    
+    def _mpc_scipy(self, waypoints, yaw_refs, current_speed, desired_speed, brake,
+                   dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
+                   obstacles=None):
+        '''MPC using scipy.optimize (fallback)'''
+        N = len(waypoints)
+        
+        # Decision variables: [steer_0, throttle_0, ..., steer_N-1, throttle_N-1]
+        n_vars = 2 * N
+        x0 = np.zeros(n_vars)
+        
+        # Bounds
+        bounds = [(-1.0, 1.0) if i % 2 == 0 else (0.0, self.config.clip_throttle) 
+                 for i in range(n_vars)]
+        
+        # Objective function
+        def objective(u_vec):
+            u = u_vec.reshape(N, 2)
+            state = np.array([0.0, 0.0, 0.0, current_speed])  # [x, y, yaw, speed]
+            cost = 0.0
+            lane_half_width = self.config.mpc_lane_half_width
+            lane_penalty = self.config.mpc_lane_penalty
+            
+            for k in range(N):
+                steer_k = u[k, 0]
+                throttle_k = u[k, 1]
+                
+                # Kinematic bicycle model
+                wheel = steer_gain * steer_k
+                # Slip angle calculation (matching EgoModel)
+                # beta = atan(rear_wb / (front_wb + rear_wb) * tan(wheel))
+                beta = np.arctan(rear_wb / (front_wb + rear_wb) * np.tan(wheel))
+                
+                if brake:
+                    accel = brake_accel
+                else:
+                    accel = throt_accel * throttle_k
+                
+                # State update
+                state[0] += state[3] * np.cos(state[2] + beta) * dt
+                state[1] += state[3] * np.sin(state[2] + beta) * dt
+                state[2] += state[3] / rear_wb * np.sin(beta) * dt
+                state[3] = max(0.0, state[3] + accel * dt)
+                state[3] = np.clip(state[3], self.config.mpc_min_speed, self.config.mpc_max_speed)
+                
+                # Costs
+                wp = waypoints[k]
+                tracking_error = (state[0] - wp[0])**2 + (state[1] - wp[1])**2
+                cost += self.config.mpc_q_tracking * tracking_error
+                
+                speed_error = (state[3] - desired_speed)**2
+                cost += self.config.mpc_q_speed * speed_error
+                
+                # Heading alignment cost
+                yaw_error = state[2] - yaw_refs[k]
+                yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
+                cost += self.config.mpc_q_yaw * yaw_error**2
+
+                cost += self.config.mpc_r_steer * steer_k**2
+                cost += self.config.mpc_r_throttle * throttle_k**2
+
+                # Lane penalty (hard constraint beyond half width)
+                lateral_pos = state[1]
+                lane_violation = max(0.0, abs(lateral_pos) - lane_half_width)
+                cost += lane_penalty * lane_violation**2
+                # Soft center penalty
+                cost += self.config.mpc_center_weight * lateral_pos**2
+                
+                # Obstacle avoidance penalty
+                if obstacles is not None and len(obstacles) > 0:
+                    for obs_x, obs_y, obs_radius in obstacles:
+                        # Distance from predicted position to obstacle center
+                        dist_to_obs = np.sqrt((state[0] - obs_x)**2 + (state[1] - obs_y)**2)
+                        # Penalty if too close (inverse distance with safety margin)
+                        safety_dist = obs_radius
+                        if dist_to_obs < safety_dist:
+                            # Strong penalty when inside safety margin
+                            obstacle_penalty = self.config.mpc_q_obstacle * (safety_dist - dist_to_obs)**2
+                            cost += obstacle_penalty
+            
+            # Terminal cost
+            if N > 0:
+                wp_terminal = waypoints[-1]
+                terminal_error = (state[0] - wp_terminal[0])**2 + (state[1] - wp_terminal[1])**2
+                cost += self.config.mpc_q_terminal * terminal_error
+            
+            return cost
+        
+        # Solve
+        try:
+            result = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                            options={'maxiter': 50, 'ftol': 1e-4})
+            u_opt = result.x.reshape(N, 2)
+            steer = float(u_opt[0, 0])
+            throttle = float(u_opt[0, 1])
+        except:
+            # Fallback
+            if len(waypoints) > 0:
+                aim = waypoints[0]
+                angle = np.arctan2(aim[1], aim[0])
+                steer = np.clip(angle / (np.pi/2), -1.0, 1.0)
+            else:
+                steer = 0.0
+            throttle = 0.5 if not brake else 0.0
+        
+        return steer, throttle
+
+
+
+
+
     def forward_ego(self, rgb, lidar_bev, target_point, target_point_image, ego_vel, bev_points=None, cam_points=None, save_path=None, expert_waypoints=None,
                     stuck_detector=0, forced_move=False, num_points=None, rgb_back=None, debug=False):
         
@@ -705,6 +1208,10 @@ class LidarCenterNet(nn.Module):
 
         pred_wp, _, _, _, _ = self.forward_gru(fused_features, target_point)
 
+        # Always compute BEV segmentation for MPC
+        pred_bev = self.pred_bev(features[0])
+        pred_bev = F.interpolate(pred_bev, (self.config.bev_resolution_height, self.config.bev_resolution_width), mode='bilinear', align_corners=True)
+
         preds = self.head([features[0]])
         results = self.head.get_bboxes(preds[0], preds[1], preds[2], preds[3], preds[4], preds[5], preds[6])
         bboxes, _ = results[0]
@@ -713,13 +1220,15 @@ class LidarCenterNet(nn.Module):
         bboxes = bboxes[bboxes[:, -1] > self.config.bb_confidence_threshold]
         rotated_bboxes = []
         for bbox in bboxes.detach().cpu().numpy():
-            bbox = self.get_bbox_local_metric(bbox)
-            rotated_bboxes.append(bbox)
+            # Extract speed before transformation (bbox format: [x, y, w, h, yaw, velocity, brake, confidence])
+            # Note: bbox[5] is velocity (speed) from the detection head
+            original_speed = float(bbox[5]) if len(bbox) > 5 else 0.0
+            bbox_transformed = self.get_bbox_local_metric(bbox)
+            # Store with speed for MPC: (bbox_corners, brake, confidence, speed)
+            rotated_bboxes.append((bbox_transformed[0], bbox_transformed[1], bbox_transformed[2], original_speed))
 
         self.i += 1
         if debug and self.i % 2 == 0 and not (save_path is None):
-            pred_bev = self.pred_bev(features[0])
-            pred_bev = F.interpolate(pred_bev, (self.config.bev_resolution_height, self.config.bev_resolution_width), mode='bilinear', align_corners=True)
             pred_semantic = self.seg_decoder(image_features_grid)
             pred_depth = self.depth_decoder(image_features_grid)
 
@@ -728,7 +1237,7 @@ class LidarCenterNet(nn.Module):
                             gt_bboxes=None, expert_waypoints=expert_waypoints, stuck_detector=stuck_detector, forced_move=forced_move)
 
 
-        return pred_wp, rotated_bboxes
+        return pred_wp, rotated_bboxes, pred_bev
 
     def forward(self, rgb, lidar_bev, ego_waypoint, target_point, target_point_image, ego_vel, bev, label, depth, semantic, num_points=None, save_path=None, bev_points=None, cam_points=None):
         loss = {}

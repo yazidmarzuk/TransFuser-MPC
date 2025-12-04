@@ -92,9 +92,8 @@ class LeaderboardEvaluator(object):
         # Load agent
         module_name = os.path.basename(args.agent).split('.')[0]
         sys.path.insert(0, os.path.dirname(args.agent))
-        self.module_agent = importlib.import_module(module_name)
+        self.module_agent = importlib.import_module(module_name) #Marzuk: importing submission_agent.py
 
-        # Create the ScenarioManager
         self.manager = ScenarioManager(args.timeout, args.debug > 1)
 
         # Time control for summary purposes
@@ -114,7 +113,7 @@ class LeaderboardEvaluator(object):
         elif self.manager:
             self.manager.signal_handler(signum, frame)
 
-    def __del__(self):
+    def __del__(self): #Marzuk: How to trigger this function?
         """
         Cleanup and delete actors, ScenarioManager and CARLA world
         """
@@ -259,17 +258,17 @@ class LeaderboardEvaluator(object):
         # Prepare the statistics of the route
         self.statistics_manager.set_route(config.name, config.index)
         if int(os.environ['DATAGEN'])==1:
-            CarlaDataProvider._rng = random.RandomState(config.index)
+            CarlaDataProvider._rng = random.RandomState(config.index) #Marzuk: Random state for the data generation
 
         # Set up the user's agent, and the timer to avoid freezing the simulation
         try:
-            self._agent_watchdog.start()
-            agent_class_name = getattr(self.module_agent, 'get_entry_point')()
+            self._agent_watchdog.start() #Marzuk: starting the watchdog timer
+            agent_class_name = getattr(self.module_agent, 'get_entry_point')() #Marzuk: HybridAgent
             if int(os.environ['DATAGEN'])==1:
                 self.agent_instance = getattr(self.module_agent, agent_class_name)(args.agent_config, config.index)
             else:
                 self.agent_instance = getattr(self.module_agent, agent_class_name)(args.agent_config)
-            config.agent = self.agent_instance
+            config.agent = self.agent_instance 
 
             # Check and store the sensors
             if not self.sensors:
@@ -397,7 +396,7 @@ class LeaderboardEvaluator(object):
         route_indexer = RouteIndexer(args.routes, args.scenarios, args.repetitions)
 
         if args.resume:
-            route_indexer.resume(args.checkpoint)
+            route_indexer.resume(args.checkpoint) #Marzuk: Resume from the last checkpoint 
             self.statistics_manager.resume(args.checkpoint)
         else:
             self.statistics_manager.clear_record(args.checkpoint)
@@ -405,10 +404,10 @@ class LeaderboardEvaluator(object):
 
         while route_indexer.peek():
             # setup
-            config = route_indexer.next()
+            config = route_indexer.next() 
 
             # run
-            self._load_and_run_scenario(args, config)
+            self._load_and_run_scenario(args, config) #Marzuk: Load with the new Scenario
 
             route_indexer.save_state(args.checkpoint)
 

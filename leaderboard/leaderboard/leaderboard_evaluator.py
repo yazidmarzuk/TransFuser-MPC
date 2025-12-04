@@ -88,7 +88,7 @@ class LeaderboardEvaluator(object):
         # Load agent
         module_name = os.path.basename(args.agent).split('.')[0]
         sys.path.insert(0, os.path.dirname(args.agent))
-        self.module_agent = importlib.import_module(module_name)
+        self.module_agent = importlib.import_module(module_name) #Marzuk: importing submission_agent.py
 
         # Create the ScenarioManager
         self.manager = ScenarioManager(args.timeout, args.debug > 1)
@@ -169,7 +169,7 @@ class LeaderboardEvaluator(object):
                                                                              vehicle.rolename,
                                                                              color=vehicle.color,
                                                                              vehicle_category=vehicle.category))
-
+                                        
         else:
             ego_vehicle_missing = True
             while ego_vehicle_missing:

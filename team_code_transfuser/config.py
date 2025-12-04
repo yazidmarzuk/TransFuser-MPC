@@ -7,7 +7,7 @@ class GlobalConfig:
     # use different seq len for image and lidar
     img_seq_len = 1 
     lidar_seq_len = 1
-    pred_len = 4 # future waypoints predicted
+    pred_len = 16 # Marzuk: maybe increase this to 8.
     scale = 1 # image pre-processing
     img_resolution = (160, 704) # image pre-processing in H, W
     img_width = 320 # important this should be consistent with scale, e.g. scale = 1, img_width 320, scale=2, image_width 640
@@ -202,6 +202,26 @@ class GlobalConfig:
     brake_ratio = 1.1 # ratio of speed to desired speed at which brake is triggered
     clip_delta = 0.25 # maximum change in speed input to logitudinal controller
     clip_throttle = 0.75 # Maximum throttle allowed by the controller
+
+    # MPC Controller parameters
+    mpc_horizon = 10 # Prediction horizon (number of steps)
+    mpc_dt = 0.05 # Time step for MPC (20 FPS = 0.05s)
+    mpc_max_speed = 8.0 # Maximum speed in m/s when MPC tuned for corners
+    mpc_min_speed = 0.0 # Minimum speed in m/s
+    mpc_q_tracking = 1000.0 # Weight for tracking error (waypoint following)
+    mpc_q_speed = 5.0 # Weight for speed tracking
+    mpc_r_steer = 1125 # Weight for steering control effort (higher -> smoother turns)
+    mpc_r_throttle = 0.5 # Weight for throttle control effort
+    mpc_r_brake = 0.5 # Weight for brake control effort
+    mpc_q_terminal = 5.0 # Terminal cost weight (final waypoint)
+    mpc_q_yaw = 0 # Weight for heading alignment
+    mpc_lane_half_width = 1.2 # Allowed lateral deviation from the route centre (meters)
+    mpc_lane_penalty = 5000.0 # Penalty weight when exceeding lane width
+    mpc_steer_gain = 0.36848336 # Gain translating steering command to wheel angle
+    mpc_center_weight = 50.0 # Soft penalty to avoid hugging the apex
+    # Obstacle avoidance constraints
+    mpc_q_obstacle = 10000.0 # Weight for obstacle avoidance penalty (high to strongly avoid)
+    mpc_obstacle_safety_margin = 1.5 # Safety margin around obstacles in meters
 
     def __init__(self, root_dir='', setting='all', **kwargs):
         self.root_dir = root_dir
