@@ -383,11 +383,11 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             safety_box      = safety_box[safety_box[..., 0] > self.config.safety_box_x_min]
             safety_box      = safety_box[safety_box[..., 0] < self.config.safety_box_x_max]
 
-        # steer, throttle, brake = self.nets[0].control_pid(self.pred_wp, gt_velocity, is_stuck)
+        steer, throttle, brake = self.nets[0].control_pid(self.pred_wp, gt_velocity, is_stuck)
         
         
         # Marzuk: using MPC controller with obstacle avoidance
-        steer, throttle, brake = self.nets[0].control_mpc(self.pred_wp, gt_velocity, is_stuck, rotated_bboxes=bbs_vehicle_coordinate_system)
+        # steer, throttle, brake = self.nets[0].control_mpc(self.pred_wp, gt_velocity, is_stuck, rotated_bboxes=bbs_vehicle_coordinate_system)
         
         if is_stuck and self.forced_move==1: # no steer for initial frame when unblocking
             steer = 0.0

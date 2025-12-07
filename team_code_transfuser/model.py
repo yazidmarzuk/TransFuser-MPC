@@ -500,12 +500,19 @@ class LidarCenterNetHead(BaseDenseHead, BBoxTestMixin):
         topk_xs = topk_xs + offset[..., 0]
         topk_ys = topk_ys + offset[..., 1]
 
-        ratio = 4.
+        feat_h = center_heatmap_pred.shape[2]
+        feat_w = center_heatmap_pred.shape[3]
+        scale_y = float(self.train_cfg.lidar_resolution_height) / float(feat_h)
+        scale_x = float(self.train_cfg.lidar_resolution_width) / float(feat_w)
+
+        topk_xs = topk_xs * scale_x
+        topk_ys = topk_ys * scale_y
+        wh[..., 0] = wh[..., 0] * scale_x
+        wh[..., 1] = wh[..., 1] * scale_y
 
         batch_bboxes = torch.stack([topk_xs, topk_ys, wh[..., 0], wh[..., 1], yaw, velocity, brake], dim=2)
         batch_bboxes = torch.cat((batch_bboxes, batch_scores[..., None]),
                                  dim=-1)
-        batch_bboxes[:, :, :4] *= ratio
 
         return batch_bboxes, batch_topk_labels
 
@@ -763,9 +770,10 @@ class LidarCenterNet(nn.Module):
             horizon_time,
             self.config.mpc_dt
         )
-        closest_ahead = None
+        closest_info = None  # (distance_ahead, obstacle_speed)
         lane_clearance = self.config.mpc_lane_half_width + self.config.mpc_obstacle_lateral_margin
-        for obs_x, obs_y, obs_radius in obstacles:
+        follow_buffer = self.config.mpc_obstacle_follow_distance
+        for obs_x, obs_y, obs_radius, obs_speed in obstacles:
             if obs_x < -obs_radius:
                 continue
             if abs(obs_y) > lane_clearance + obs_radius:
@@ -773,8 +781,8 @@ class LidarCenterNet(nn.Module):
             distance_ahead = obs_x - obs_radius
             if distance_ahead < 0.0:
                 distance_ahead = 0.0
-            if closest_ahead is None or distance_ahead < closest_ahead:
-                closest_ahead = distance_ahead
+            if closest_info is None or distance_ahead < closest_info[0]:
+                closest_info = (distance_ahead, obs_speed)
 
         if len(waypoints) >= 6:
             # Find maximum lateral displacement across horizon
@@ -786,21 +794,37 @@ class LidarCenterNet(nn.Module):
             else:
                 lateral_change_rate = 0.0
             
-            # Apply speed limits based on max lateral OR change rate
-            if max_lateral > 2.0 or lateral_change_rate > 0.4:  # Very sharp turn
-                desired_speed = min(desired_speed, 2)
-            elif max_lateral > 1.2 or lateral_change_rate > 0.25:  # Sharp turn
-                desired_speed = min(desired_speed, 3)
-            elif max_lateral > 0.6 or lateral_change_rate > 0.15:  # Medium turn
-                desired_speed = min(desired_speed, 4)
+            # Apply speed limits based on max lateral OR change rate (MORE LENIENT)
+            if max_lateral > 3.0 or lateral_change_rate > 0.6:  # Very sharp turn
+                desired_speed = min(desired_speed, 3.0)
+            elif max_lateral > 1.5 or lateral_change_rate > 0.35:  # Sharp turn
+                desired_speed = min(desired_speed, 5.0)
+            elif max_lateral > 0.8 or lateral_change_rate > 0.20:  # Medium turn
+                desired_speed = min(desired_speed, 6.0)
 
         obstacle_brake = False
-        if closest_ahead is not None:
-            if closest_ahead < self.config.mpc_obstacle_stop_distance:
+        if closest_info is not None:
+            gap, obs_speed = closest_info
+            obs_speed = max(0.0, obs_speed)
+
+            if gap < self.config.mpc_obstacle_stop_distance:
                 desired_speed = min(desired_speed, self.config.mpc_obstacle_stop_speed)
                 obstacle_brake = True
-            elif closest_ahead < self.config.mpc_obstacle_slow_distance:
+            elif gap < self.config.mpc_obstacle_slow_distance:
                 desired_speed = min(desired_speed, self.config.mpc_obstacle_slow_speed)
+
+            effective_gap = max(0.0, gap - follow_buffer)
+            if effective_gap <= 0.0:
+                desired_speed = min(desired_speed, self.config.mpc_obstacle_stop_speed)
+                obstacle_brake = True
+            else:
+                time_gap = max(0.1, self.config.mpc_obstacle_follow_time_gap)
+                follow_speed = effective_gap / time_gap
+                follow_speed = min(follow_speed, obs_speed + self.config.mpc_obstacle_speed_offset)
+                desired_speed = min(desired_speed, follow_speed)
+
+            if self.config.debug:
+                print(f"Obstacle ahead gap={gap:.2f}m obs_speed={obs_speed:.2f} -> desired_speed {desired_speed:.2f}")
 
         #Marzuk: Check if we need to brake
         brake = ((desired_speed < self.config.brake_speed) or 
@@ -819,7 +843,7 @@ class LidarCenterNet(nn.Module):
                                              rotated_bboxes=rotated_bboxes,
                                              obstacles=obstacles)
         
-        max_steer_change = 0.15  # Maximum change per timestep (0.05s)
+        max_steer_change = 0.30  # Maximum change per timestep (0.05s)
         steer_change = steer - self.prev_steer
         steer = self.prev_steer + np.clip(steer_change, -max_steer_change, max_steer_change)
         self.prev_steer = steer
@@ -833,7 +857,7 @@ class LidarCenterNet(nn.Module):
     def _process_obstacles_for_mpc(self, rotated_bboxes, horizon_time, dt):
         '''
         Process detected obstacles for MPC constraint.
-        Returns list of (center_x, center_y, radius) for each obstacle.
+        Returns list of (center_x, center_y, radius, speed) for each obstacle.
         '''
         if rotated_bboxes is None or len(rotated_bboxes) == 0:
             return []
@@ -879,18 +903,62 @@ class LidarCenterNet(nn.Module):
                     velocity_unit = velocity_dir / velocity_magnitude
                     velocity_vec = velocity_unit * speed  # Use actual speed from detection
                     predicted_center = center + velocity_vec * horizon_time
-                    obstacles.append((predicted_center[0], predicted_center[1], radius))
+                    obstacles.append((predicted_center[0], predicted_center[1], radius, speed))
                 else:
                     # Static obstacle
-                    obstacles.append((center[0], center[1], radius))
+                    obstacles.append((center[0], center[1], radius, speed))
             else:
                 # Static obstacle (no speed or speed too low)
-                obstacles.append((center[0], center[1], radius))
+                obstacles.append((center[0], center[1], radius, speed))
         
         return obstacles
-    
+        
+    def _interpolate_waypoints_for_mpc(self, gru_waypoints, horizon_steps, dt):
+        """
+        Interpolate GRU waypoints to match MPC timestep spacing.
+        
+        Args:
+            gru_waypoints: [N_gru, 2] waypoints from GRU in vehicle frame
+            horizon_steps: number of MPC steps 
+            dt: MPC timestep (0.05s)
+        
+        Returns:
+            mpc_waypoints: [horizon_steps, 2] interpolated waypoints
+        """
+        from scipy.interpolate import interp1d
+        
+        # === CRITICAL FIX: Prepend current position at t=0 ===
+        current_pos = np.array([[0.0, 0.0]])  # Vehicle is at origin
+        gru_waypoints_with_origin = np.vstack([current_pos, gru_waypoints])
+        # ======================================================
+        
+        # GRU waypoints are at [0.0s, 0.5s, 1.0s, 1.5s, 2.0s, ...]
+        gru_dt = 0.5  # Time between GRU waypoints
+        gru_times = np.arange(len(gru_waypoints_with_origin)) * gru_dt
+        gru_times[0] = 0.0  # Current position is at t=0
+        
+        # MPC wants waypoints at [0.05s, 0.10s, 0.15s, ...]
+        mpc_times = np.arange(1, horizon_steps + 1) * dt  # Start from dt, not 0
+        
+        # Clip to avoid extrapolation beyond last GRU waypoint
+        max_time = gru_times[-1]
+        mpc_times = np.clip(mpc_times, 0, max_time)
+        
+        # Interpolate x and y separately
+        interp_x = interp1d(gru_times, gru_waypoints_with_origin[:, 0], 
+                            kind='linear', fill_value='extrapolate')
+        interp_y = interp1d(gru_times, gru_waypoints_with_origin[:, 1], 
+                            kind='linear', fill_value='extrapolate')
+        
+        mpc_waypoints = np.column_stack([
+            interp_x(mpc_times),
+            interp_y(mpc_times)
+        ])
+        
+        return mpc_waypoints
+        
     def _mpc_optimize(self, waypoints, current_speed, desired_speed, brake=False, 
-                      rotated_bboxes=None):
+                  rotated_bboxes=None, obstacles=None):
         '''
         MPC optimization using CasADi or scipy.
         Args:
@@ -903,8 +971,11 @@ class LidarCenterNet(nn.Module):
             steer: steering command
             throttle: throttle command
         '''
-        N = min(len(waypoints), self.config.mpc_horizon)
+        N = self.config.mpc_horizon
         dt = self.config.mpc_dt
+        
+        # Interpolate GRU waypoints to MPC time resolution
+        waypoints = self._interpolate_waypoints_for_mpc(waypoints, N, dt)
         
         #Marzuk: Kinematic bicycle model parameters (got this from EgoModel)
         front_wb = -0.090769015
@@ -929,10 +1000,16 @@ class LidarCenterNet(nn.Module):
         yaw_refs = yaw_refs[:N]
         
         # Process obstacles for MPC
-        horizon_time = N * dt
-        obstacles = self._process_obstacles_for_mpc(rotated_bboxes, horizon_time, dt)
+        if obstacles is None:
+            horizon_time = max(1, N) * dt
+            obstacles = self._process_obstacles_for_mpc(rotated_bboxes, horizon_time, dt)
 
-        return self._mpc_casadi(waypoints[:N], yaw_refs, current_speed, desired_speed, brake,
+        if CASADI_AVAILABLE:
+            return self._mpc_casadi(waypoints[:N], yaw_refs, current_speed, desired_speed, brake,
+                                    dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
+                                    obstacles=obstacles)
+        else:
+            return self._mpc_scipy(waypoints[:N], yaw_refs, current_speed, desired_speed, brake,
                                     dt, front_wb, rear_wb, steer_gain, brake_accel, throt_accel,
                                     obstacles=obstacles)
         
@@ -990,10 +1067,21 @@ class LidarCenterNet(nn.Module):
             opti.subject_to(X[2, k+1] == yaw_next)
             opti.subject_to(X[3, k+1] == speed_next)
             
-            # Tracking cost
+            # Tracking cost with progressive weighting (prioritize near waypoints)
             wp = waypoints[k]
             tracking_error = (X[0, k+1] - wp[0])**2 + (X[1, k+1] - wp[1])**2
-            cost += self.config.mpc_q_tracking * tracking_error
+
+            # Exponentially decay the weight for distant waypoints
+            weight_decay = 1.0 / (1.0 + 0.1 * k)  # Near: 1.0, far: ~0.3
+            cost += self.config.mpc_q_tracking * weight_decay * tracking_error
+
+            # === SOFT curb avoidance (bounded penalty) ===
+            lateral_pos = X[1, k+1]
+            safe_margin = 0.8  # Stay within ±0.8m (0.4m buffer from 1.2m limit)
+
+            # Quadratic penalty outside safe zone (bounded, won't explode)
+            lateral_violation = ca.fmax(0, ca.fabs(lateral_pos) - safe_margin)
+            cost += 200.0 * lateral_violation**2
             
             # Speed tracking cost
             speed_error = (X[3, k+1] - desired_speed)**2
@@ -1008,21 +1096,11 @@ class LidarCenterNet(nn.Module):
             cost += self.config.mpc_r_steer * steer_k**2
             cost += self.config.mpc_r_throttle * throttle_k**2
             
-            # Lane keeping penalty (hard constraint beyond half width)
-            lateral_pos = X[1, k+1]
-            lane_violation = ca.fmax(0, ca.fabs(lateral_pos) - lane_half_width)
-            cost += lane_penalty * lane_violation**2
-            # Soft center penalty keeps vehicle near lane middle
-            cost += self.config.mpc_center_weight * lateral_pos**2
-            
             # Obstacle avoidance penalty
             if obstacles is not None and len(obstacles) > 0:
-                for obs_x, obs_y, obs_radius in obstacles:
-                    # Distance from predicted position to obstacle center
+                for obs_x, obs_y, obs_radius, _ in obstacles:
                     dist_to_obs = ca.sqrt((X[0, k+1] - obs_x)**2 + (X[1, k+1] - obs_y)**2)
-                    # Penalty if too close (inverse distance with safety margin)
                     safety_dist = obs_radius
-                    # Use CasADi conditional: penalty only when inside safety margin
                     violation = ca.fmax(0.0, safety_dist - dist_to_obs)
                     obstacle_penalty = self.config.mpc_q_obstacle * violation**2
                     cost += obstacle_penalty
@@ -1047,51 +1125,35 @@ class LidarCenterNet(nn.Module):
             'ipopt.sb': 'yes',
         })
         # print("Optimizer solver called")
-        
         try:
             sol = opti.solve()
             steer = float(sol.value(U[0, 0]))
             throttle = float(sol.value(U[1, 0]))
             
-            # # === MARZUK DIAGNOSTIC LOGS ===
-            # print(f"\n=== MPC SOLUTION ===")
-            # print(f"Commanded Steer: {steer:.4f}")
-            # print(f"Wheel Angle: {steer * steer_gain:.4f} rad = {np.degrees(steer * steer_gain):.2f}°")
-            # print(f"Speed: {current_speed:.2f} m/s")
+            # === DIAGNOSTIC LOGGING ===
+            print(f"\n{'='*60}")
+            print(f"MPC SOLUTION @ speed={current_speed:.2f} m/s")
+            print(f"Commanded: steer={steer:.4f}, throttle={throttle:.4f}")
             
-            # # Predicted trajectory (first 5 steps)
-            # print(f"Predicted path (x,y):")
-            # for k in range(min(5, N+1)):
-            #     x_pred = float(sol.value(X[0, k]))
-            #     y_pred = float(sol.value(X[1, k]))
-            #     yaw_pred = float(sol.value(X[2, k]))
-            #     print(f"  Step {k}: ({x_pred:.3f}, {y_pred:.3f}), yaw={np.degrees(yaw_pred):.1f}°")
+            # Check first 3 steps
+            for k in range(min(3, N)):
+                x_pred = float(sol.value(X[0, k+1]))
+                y_pred = float(sol.value(X[1, k+1]))
+                yaw_pred = float(sol.value(X[2, k+1]))
+                
+                # Tracking error
+                dx = x_pred - waypoints[k][0]
+                dy = y_pred - waypoints[k][1]
+                error = np.sqrt(dx**2 + dy**2)
+                
+                print(f"Step {k}: pred=({x_pred:.2f}, {y_pred:.2f}) "
+                    f"target=({waypoints[k][0]:.2f}, {waypoints[k][1]:.2f}) "
+                    f"error={error:.3f}m yaw={np.degrees(yaw_pred):.1f}°")
             
-            # # Target waypoints (first 5)
-            # print(f"Target waypoints (x,y):")
-            # for k in range(min(5, N)):
-            #     print(f"  WP {k}: ({waypoints[k][0]:.3f}, {waypoints[k][1]:.3f})")
-            
-            # # Error between predicted and target
-            # print(f"Prediction errors (lateral):")
-            # for k in range(min(5, N)):
-            #     x_pred = float(sol.value(X[0, k+1]))
-            #     y_pred = float(sol.value(X[1, k+1]))
-            #     y_error = y_pred - waypoints[k][1]
-            #     print(f"  Step {k}: lateral_error = {y_error:.3f}m")
-            
-            # # Cost breakdown (if you can compute it)
-            # total_cost = float(sol.value(cost))
-            # print(f"Total cost: {total_cost:.2f}")
-            # print(f"===================\n")
-            
-            yaw_trajectory = [float(sol.value(X[2, k])) for k in range(min(3, N+1))]
-
+            print(f"{'='*60}\n")
 
         except Exception as e:
-            print(f"✗ OPTIMIZER FAILED: {type(e).__name__}: {str(e)}")
-
-            # Fallback to simple control if optimization fails
+            print(f"✗ MPC FAILED: {type(e).__name__}: {str(e)}")
             if len(waypoints) > 0:
                 aim = waypoints[0]
                 angle = np.arctan2(aim[1], aim[0])
@@ -1099,7 +1161,6 @@ class LidarCenterNet(nn.Module):
             else:
                 steer = 0.0
             throttle = 0.5 if not brake else 0.0
-        
         return steer, throttle
     
 
@@ -1152,9 +1213,9 @@ class LidarCenterNet(nn.Module):
         bboxes = bboxes[bboxes[:, -1] > self.config.bb_confidence_threshold]
         for idx, det in enumerate(bboxes.detach().cpu().numpy()):
             cx, cy, w, l, yaw, vel, brake, conf = det
-            print(f"[det {idx:02d}] pos=({cx:.2f}, {cy:.2f}) m "
-                f"conf={conf:.2f} vel={vel:.2f} "
-                f"brake={brake:.2f}")
+            # print(f"[det {idx:02d}] pos=({cx:.2f}, {cy:.2f}) m "
+            #     f"conf={conf:.2f} vel={vel:.2f} "
+            #     f"brake={brake:.2f}")
         rotated_bboxes = []
         for bbox in bboxes.detach().cpu().numpy():
             # Extract speed before transformation (bbox format: [x, y, w, h, yaw, velocity, brake, confidence])
@@ -1256,20 +1317,22 @@ class LidarCenterNet(nn.Module):
     def get_bbox_local_metric(self, bbox):
         x, y, w, h, yaw, speed, brake, confidence = bbox
 
-        w = w / self.config.bounding_box_divisor / self.config.pixels_per_meter # We multiplied by 2 when collecting the data, and multiplied by 8 when loading the labels.
-        h = h / self.config.bounding_box_divisor / self.config.pixels_per_meter # We multiplied by 2 when collecting the data, and multiplied by 8 when loading the labels.
+        pixels_per_meter = self.config.pixels_per_meter
+        half_width = self.config.lidar_resolution_width / 2.0
+        forward_offset = self.config.lidar_resolution_height
 
-        T = get_lidar_to_bevimage_transform()
-        T_inv = np.linalg.inv(T)
+        # convert BEV image coordinates to ego vehicle frame (x forward, y right)
+        x_forward = (forward_offset - y) / pixels_per_meter
+        y_left = (half_width - x) / pixels_per_meter
 
-        center = np.array([x,y,1.0])
+        center_vehicle = np.array([
+            x_forward + self.config.lidar_pos[0],
+            -(y_left + self.config.lidar_pos[1]),
+            self.config.lidar_pos[2]
+        ])
 
-        center_old_coordinate_sys = T_inv @ center
-
-        center_old_coordinate_sys = center_old_coordinate_sys + np.array(self.config.lidar_pos)
-
-        #Convert to standard CARLA right hand coordinate system
-        center_old_coordinate_sys[1] =  -center_old_coordinate_sys[1]
+        w = w / self.config.bounding_box_divisor / pixels_per_meter
+        h = h / self.config.bounding_box_divisor / pixels_per_meter
 
         bbox = np.array([[-h, -w, 1],
                          [-h,  w, 1],
@@ -1284,7 +1347,7 @@ class LidarCenterNet(nn.Module):
 
         for point_index in range(bbox.shape[0]):
             bbox[point_index] = R @ bbox[point_index]
-            bbox[point_index] = bbox[point_index] + np.array([center_old_coordinate_sys[0], center_old_coordinate_sys[1],0])
+            bbox[point_index] = bbox[point_index] + np.array([center_vehicle[0], center_vehicle[1], 0])
 
         return bbox, brake, confidence
 
