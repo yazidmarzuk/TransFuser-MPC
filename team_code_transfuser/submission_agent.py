@@ -31,6 +31,28 @@ def get_entry_point():
     return 'HybridAgent' #Marzuk: This is the entry point for the agent
 
 
+def compute_true_cte(ego_pos_world, route_points_world):
+    """
+    ego_pos_world: np.array([x, y])
+    route_points_world: np.array([[x1,y1], [x2,y2], ...])  # the full ground-truth route
+    Returns: cross-track error in meters (absolute distance to nearest segment)
+    """
+    # Build line segments
+    A = route_points_world[:-1]
+    B = route_points_world[1:]
+    
+    # Vectorized projection of ego point onto all segments
+    AB = B - A
+    AP = ego_pos_world - A
+    proj = np.sum(AB * AP, axis=1, keepdims=True)  # dot product
+    len2 = np.sum(AB * AB, axis=1, keepdims=True)
+    len2[len2 == 0] = 1e-8
+    
+    t = np.clip(proj / len2, 0, 1)
+    closest = A + t * AB
+    distances = np.linalg.norm(closest - ego_pos_world, axis=1)
+    return float(np.min(distances))
+
 class HybridAgent(autonomous_agent.AutonomousAgent):
     def setup(self, path_to_conf_file, route_index=None):
         self.track = autonomous_agent.Track.SENSORS
@@ -114,11 +136,31 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             log_file.write('step,ego_x,ego_y,yaw_deg,wp_idx,wp_x_vehicle,wp_y_vehicle,wp_x_world,wp_y_world,dist,prev_wp_x_world,prev_wp_y_world,prev_error_x,prev_error_y,prev_error_dist,ref_wp_x_world,ref_wp_y_world,expert_wp_x_vehicle,expert_wp_y_vehicle,expert_wp_x_world,expert_wp_y_world,expert_dist,gru_vs_expert_dx,gru_vs_expert_dy,gru_vs_expert_dist\n')
         self.prev_predicted_wp_world = None
         self.log_max_expert = 10
+        
+        self.controller_type = 'PID'   # ←←← CHANGE THIS TO 'PID' WHEN TESTING PID!
+        os.makedirs(log_dir, exist_ok=True)
+
+        self.error_log_path = os.path.join(log_dir, f'path_error_{self.controller_type}.csv')
+        with open(self.error_log_path, 'w') as f:
+            f.write('step,ego_x,ego_y,wp_error_m,geometric_cte_m,speed_mps,target_wp_x,target_wp_y\n')
+        
+        # ←←← ADD THIS LINE: store full route as numpy array (world coordinates)
+        self.full_route_world = None  # will be filled in _init()
 
 
     def _init(self):
         self._route_planner = RoutePlanner(self.config.route_planner_min_distance, self.config.route_planner_max_distance)
         self._route_planner.set_route(self._global_plan, True)
+
+        # Full route for geometric CTE
+        route_points = np.array([pos for pos, _ in self._route_planner.route])
+        self.full_route_world = route_points + self._route_planner.mean
+        log_dir = SAVE_PATH if SAVE_PATH else os.path.join(os.getcwd(), 'results')
+        # Save CSV once
+        route_csv = os.path.join(log_dir, 'ground_truth_route.csv')
+        if not os.path.exists(route_csv):
+            np.savetxt(route_csv, self.full_route_world, delimiter=',', header='x,y', comments='', fmt='%.3f')
+
         self.initialized = True
 
     def _get_position(self, tick_data):
@@ -263,12 +305,34 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
 
         # Need to run this every step for GPS denoising
         tick_data = self.tick(input_data)
-
         # repeat actions twice to ensure LiDAR data availability
         if self.step % self.config.action_repeat == 1:
             self.update_gps_buffer(self.control, tick_data['compass'], tick_data['speed'])
             return self.control
+        
+        # === ULTIMATE LOGGING: Waypoint Error + Geometric CTE ===
+        if hasattr(self, 'error_log_path') and self.step % self.config.action_repeat == 0:
+            # Current ego position in world
+            ego_x = tick_data['denoised_gps'][0] + self._route_planner.mean[0]
+            ego_y = tick_data['denoised_gps'][1] + self._route_planner.mean[1]
+            ego_pos = np.array([ego_x, ego_y])
 
+            # 1. Waypoint Tracking Error (distance to CURRENT target waypoint)
+            # This is what you see visually — the black dot the car is "chasing"
+            waypoint_route = self._route_planner.run_step(tick_data['denoised_gps'])
+            current_target_wp = waypoint_route[0][0]  # first waypoint
+            target_wp_world = current_target_wp + self._route_planner.mean
+            wp_error = np.linalg.norm(ego_pos - target_wp_world)
+
+            # 2. Geometric CTE (distance to route centerline)
+            geometric_cte = compute_true_cte(ego_pos, self.full_route_world)
+
+            speed = tick_data['speed']
+
+            with open(self.error_log_path, 'a') as f:
+                f.write(f'{self.step},{ego_x:.3f},{ego_y:.3f},{wp_error:.4f},{geometric_cte:.4f},{speed:.3f},'
+                        f'{target_wp_world[0]:.3f},{target_wp_world[1]:.3f}\n')
+        # ======================================================================
         # prepare image input
         image = self.prepare_image(tick_data)
 
@@ -383,11 +447,11 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             safety_box      = safety_box[safety_box[..., 0] > self.config.safety_box_x_min]
             safety_box      = safety_box[safety_box[..., 0] < self.config.safety_box_x_max]
 
-        # steer, throttle, brake = self.nets[0].control_pid(self.pred_wp, gt_velocity, is_stuck)
+        steer, throttle, brake = self.nets[0].control_pid(self.pred_wp, gt_velocity, is_stuck)
         
         
         # Marzuk: using MPC controller with obstacle avoidance
-        steer, throttle, brake = self.nets[0].control_mpc(self.pred_wp, gt_velocity, is_stuck, rotated_bboxes=bbs_vehicle_coordinate_system)
+        # steer, throttle, brake = self.nets[0].control_mpc(self.pred_wp, gt_velocity, is_stuck, rotated_bboxes=bbs_vehicle_coordinate_system)
         
         if is_stuck and self.forced_move==1: # no steer for initial frame when unblocking
             steer = 0.0
