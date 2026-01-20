@@ -204,21 +204,22 @@ class GlobalConfig:
     clip_throttle = 0.75 # Maximum throttle allowed by the controller
 
     # MPC Controller parameters
-    mpc_horizon = 10 # Prediction horizon (number of steps)
-    mpc_dt = 0.05 # Time step for MPC (20 FPS = 0.05s)
-    mpc_max_speed = 8.0 # Maximum speed in m/s when MPC tuned for corners
-    mpc_min_speed = 0.0 # Minimum speed in m/s
-    mpc_q_tracking = 1200.0 # Weight for tracking error (waypoint following)
-    mpc_q_speed = 5.0 # Weight for speed tracking
-    mpc_r_steer = 5525 # Weight for steering control effort (higher -> smoother turns)
-    mpc_r_throttle = 0.5 # Weight for throttle control effort
-    mpc_r_brake = 0.5 # Weight for brake control effort
-    mpc_q_terminal = 5.0 # Terminal cost weight (final waypoint)
-    mpc_q_yaw = 1 # Weight for heading alignment
-    mpc_lane_half_width = 1.2 # Allowed lateral deviation from the route centre (meters)
-    mpc_lane_penalty = 5000.0 # Penalty weight when exceeding lane width
-    mpc_steer_gain = 0.36848336 # Gain translating steering command to wheel angle
-    mpc_center_weight = 50.0 # Soft penalty to avoid hugging the apex
+    mpc_horizon = 25
+    mpc_dt = 0.05
+    mpc_max_speed = 8.0
+    mpc_min_speed = 0.0
+    mpc_q_tracking = 5000.0  # Increased - really follow waypoints
+    mpc_q_speed = 10.0
+    mpc_r_steer = 5500.0  # Sweet spot between 5 (twitchy) and 3000 (stiff)
+    mpc_r_throttle = 0.5
+    mpc_r_brake = 0.5
+    mpc_q_terminal = 50.0  # Reduced - don't focus on end
+    mpc_q_yaw = 20.0
+    mpc_lane_half_width = 1.2
+    mpc_lane_penalty = 1000.0
+    mpc_steer_gain = 0.36848336
+    mpc_center_weight = 50.0
+    mpc_q_obstacle = 0.0
     # Obstacle avoidance constraints
     mpc_q_obstacle = 10000.0 # Weight for obstacle avoidance penalty (high to strongly avoid)
     mpc_obstacle_safety_margin = 1.5 # Safety margin around obstacles in meters
@@ -227,6 +228,9 @@ class GlobalConfig:
     mpc_obstacle_stop_distance = 7.5 # Distance in meters to force a stop for an obstacle ahead
     mpc_obstacle_slow_speed = 2.0 # Target speed when slowing for an obstacle
     mpc_obstacle_stop_speed = 0.2 # Target speed when stopping for an obstacle
+    mpc_obstacle_follow_distance = 8.0 # Desired minimum distance to the obstacle ahead in meters
+    mpc_obstacle_follow_time_gap = 1.2 # Time gap (s) used to compute following speed
+    mpc_obstacle_speed_offset = 0.5 # Extra margin above obstacle speed when following
 
     def __init__(self, root_dir='', setting='all', **kwargs):
         self.root_dir = root_dir
